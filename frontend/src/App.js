@@ -5,11 +5,13 @@ function App() {
   const [fileUrl, setFileUrl] = useState(null);
   const [result, setResult] = useState(null);
   const [loading, setLoading] = useState(false);
+  const [summary, setSummary] = useState("");
 
   const handleFileChange = (e) => {
     const selectedFile = e.target.files[0];
     setFile(selectedFile);
     setResult(null);
+    setSummary("");
     if (selectedFile) {
       setFileUrl(URL.createObjectURL(selectedFile));
     } else {
@@ -22,6 +24,7 @@ function App() {
     if (!file) return;
     setLoading(true);
     setResult(null);
+    setSummary("");
 
     const formData = new FormData();
     formData.append("file", file);
@@ -33,8 +36,25 @@ function App() {
       });
       const data = await res.json();
       setResult(data);
+
+      // Fetch summary from /chat
+      try {
+        const chatRes = await fetch("http://127.0.0.1:8000/chat", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            pred_class: data.class_id,
+            confidence: data.confidence
+          })
+        });
+        const chatData = await chatRes.json();
+        setSummary(chatData.message);
+      } catch (err) {
+        setSummary("Could not fetch summary.");
+      }
     } catch (err) {
       setResult({ error: "Prediction failed." });
+      setSummary("");
     }
     setLoading(false);
   };
@@ -84,31 +104,6 @@ function App() {
           </button>
         </form>
 
-        {(fileUrl || result) && (
-          <div style={{ display: "flex", justifyContent: "center", gap: 32, marginTop: 32, flexWrap: "wrap" }}>
-            {fileUrl && (
-              <div style={{ textAlign: "center" }}>
-                <div style={{ fontWeight: 500, marginBottom: 8 }}>Input Image</div>
-                <img
-                  src={fileUrl}
-                  alt="Input"
-                  style={{ maxWidth: 220, maxHeight: 220, borderRadius: 12, border: "1px solid #e2e8f0", boxShadow: "0 2px 8px rgba(0,0,0,0.04)" }}
-                />
-              </div>
-            )}
-            {result && result.gradcam && (
-              <div style={{ textAlign: "center" }}>
-                <div style={{ fontWeight: 500, marginBottom: 8 }}>Grad-CAM Overlay</div>
-                <img
-                  src={`data:image/png;base64,${result.gradcam}`}
-                  alt="Grad-CAM"
-                  style={{ maxWidth: 220, maxHeight: 220, borderRadius: 12, border: "1px solid #e2e8f0", boxShadow: "0 2px 8px rgba(0,0,0,0.04)" }}
-                />
-              </div>
-            )}
-          </div>
-        )}
-
         {result && (
           <div style={{ marginTop: 32, textAlign: "center" }}>
             {result.error ? (
@@ -126,6 +121,13 @@ function App() {
                 <div style={{ fontSize: 16, color: "#276749", marginTop: 4 }}>Confidence: {(result.confidence * 100).toFixed(2)}%</div>
               </div>
             )}
+          </div>
+        )}
+
+        {summary && (
+          <div style={{ marginTop: 24, background: "#f9fafb", padding: 16, borderRadius: 8 }}>
+            <b>Summary & Advice:</b>
+            <div style={{ marginTop: 8 }}>{summary}</div>
           </div>
         )}
       </div>

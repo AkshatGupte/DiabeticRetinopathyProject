@@ -6,7 +6,8 @@ opencv-python==4.10.0.84
 matplotlib==3.9.2
 seaborn==0.13.2
 scikit-learn==1.5.2
-
+langchain-openai
+langchain-core
 # Image preprocessing & augmentation
 Pillow==10.4.0
 imgaug==0.4.0

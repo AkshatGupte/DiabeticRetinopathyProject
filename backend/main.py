@@ -7,8 +7,16 @@ import io
 import base64
 import matplotlib.pyplot as plt
 import cv2
+from langchain_openai import ChatOpenAI
+from langchain_core.prompts import PromptTemplate
+from pydantic import BaseModel
+from dotenv import load_dotenv
 
 app = FastAPI()
+
+class ChatRequest(BaseModel):
+    pred_class: int
+    confidence: float
 
 # Allow CORS for all origins (for development)
 app.add_middleware(
@@ -80,3 +88,21 @@ async def predict(file: UploadFile = File(...)):
         "confidence": confidence,
         "gradcam": gradcam_base64
     }
+
+prompt = PromptTemplate(
+    template='''
+    You are a helpful medical assistant. A user has uploaded an image of an eye and received a diagnosis.
+    The diagnosis is {diagnosis} with a confidence of {confidence:.2f}.
+    
+    You should provide the user with information about the diagnosis, possible next steps, and any relevant advice.
+    ''',
+    input_variables=["diagnosis", "confidence"]
+)
+
+load_dotenv()
+@app.post('/chat')
+async def chat(request: ChatRequest):
+    llm = ChatOpenAI(model_name="gpt-3.5-turbo", temperature=0.4)
+    template = prompt.invoke({"diagnosis": label_map[request.pred_class], "confidence": request.confidence})
+    response = llm.invoke(template)
+    return {"message": str(response.content)}
