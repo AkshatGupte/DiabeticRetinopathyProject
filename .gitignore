@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.h5
+*.sqlite3
+*.db
+.DS_Store
+.env
+.venv/
+env/
+venv/
+.idea/
+*.ipynb_checkpoints
+
+# Node/React
+node_modules/
+build/
+dist/
+npm-debug.log
+yarn-error.log
+
+# VS Code
+.vscode/
