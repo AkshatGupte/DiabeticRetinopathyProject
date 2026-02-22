@@ -1,22 +1,40 @@
-from fastapi import FastAPI, File, UploadFile
+import os
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+import logging
+logging.getLogger("tensorflow").setLevel(logging.ERROR)
+
+from fastapi import FastAPI, File, UploadFile, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+# from lime_explainer import explain_image_with_lime
 from PIL import Image
 import numpy as np
-import tensorflow as tf
 import io
 import base64
 import matplotlib.pyplot as plt
 import cv2
-from langchain_openai import ChatOpenAI
-from langchain_core.prompts import PromptTemplate
+from typing import List, Dict
 from pydantic import BaseModel
 from dotenv import load_dotenv
+from pytorch_grad_cam.utils.image import show_cam_on_image
+from conversion import load_image_as_cv2_rgb
+from chat import chain_with_history
+import torch
+from torchvision import transforms
+from model import load_retinopathy_model
+from pytorch_grad_cam import GradCAM
+from pytorch_grad_cam.utils.image import show_cam_on_image
+import traceback
+
+load_dotenv()
 
 app = FastAPI()
 
 class ChatRequest(BaseModel):
-    pred_class: int
-    confidence: float
+    session_id: str
+    messages: List[Dict[str, str]] 
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
 
 # Allow CORS for all origins (for development)
 app.add_middleware(
@@ -27,82 +45,102 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Load your trained model once at startup
-model = tf.keras.models.load_model("../best_mobilenetv2.h5")
+device = "cuda" if torch.cuda.is_available() else "cpu"
+MODEL_PATH = "models/best_efficientnet.pth"
+model = load_retinopathy_model(MODEL_PATH)
+model.to(device)
+model.eval()
+
+
 IMG_SIZE = (224, 224)
 
-# Map numeric predictions to class names
+
 label_map = {0: "No_DR", 1: "Mild", 2: "Moderate", 3: "Severe", 4: "Proliferate_DR"}
+
+preprocess = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.ToTensor(),
+    transforms.Normalize(
+        mean=[0.485, 0.456, 0.406],
+        std=[0.229, 0.224, 0.225]
+    ),
+])
 
 @app.post("/predict/")
 async def predict(file: UploadFile = File(...)):
-    # Read image file
     contents = await file.read()
-    image = Image.open(io.BytesIO(contents)).convert("RGB")
-    image = image.resize(IMG_SIZE)
-    img_array = np.array(image) / 255.0
-    img_array = np.expand_dims(img_array, axis=0)  # Add batch dimension
+    ext = file.filename.split(".")[-1].lower()
 
-    # Predict
-    preds = model.predict(img_array)
-    pred_class = int(np.argmax(preds, axis=1)[0])
-    confidence = float(np.max(preds))
+    img_cv = load_image_as_cv2_rgb(contents, ext)
+    image = Image.fromarray(img_cv)
+    img_tensor = preprocess(image).unsqueeze(0).to(device)
 
-    # Grad-CAM implementation
-    def make_gradcam_heatmap(img_array, model, last_conv_layer_name, pred_index=None):
-        grad_model = tf.keras.models.Model(
-            [model.inputs],
-            [model.get_layer(last_conv_layer_name).output, model.output]
-        )
-        with tf.GradientTape() as tape:
-            conv_outputs, predictions = grad_model(img_array)
-            if pred_index is None:
-                pred_index = tf.argmax(predictions[0])
-            class_channel = predictions[:, pred_index]
-        grads = tape.gradient(class_channel, conv_outputs)
-        pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))
-        conv_outputs = conv_outputs[0]
-        heatmap = conv_outputs @ pooled_grads[..., tf.newaxis]
-        heatmap = tf.squeeze(heatmap)
-        heatmap = tf.maximum(heatmap, 0) / tf.math.reduce_max(heatmap)
-        return heatmap.numpy()
+    
+    # Run model prediction
 
-    # Get Grad-CAM heatmap
-    last_conv_layer_name = "Conv_1"  # For MobileNetV2
-    heatmap = make_gradcam_heatmap(img_array, model, last_conv_layer_name, pred_class)
+    with torch.no_grad():
+        logits = model(img_tensor)
+        probs = torch.softmax(logits, dim=1)
 
-    # Overlay heatmap on image
-    img_for_overlay = np.array(image)
-    heatmap_resized = cv2.resize(heatmap, (img_for_overlay.shape[1], img_for_overlay.shape[0]))
+    pred_class = int(torch.argmax(probs))
+    confidence = float(torch.max(probs))
+
+    # Generate Grad-CAM heatmap
+
+    target_layer = model.blocks[-1][-1].conv_pw
+    cam = GradCAM(model=model, target_layers=[target_layer])
+
+    grayscale_cam = cam(input_tensor=img_tensor)[0]
+    heatmap = grayscale_cam
+
+    # Convert heatmap to overlay
+    img_np = np.array(image.resize((224, 224)))
+    heatmap_resized = cv2.resize(heatmap, (224, 224))
     heatmap_uint8 = np.uint8(255 * heatmap_resized)
     heatmap_color = cv2.applyColorMap(heatmap_uint8, cv2.COLORMAP_JET)
-    superimposed_img = cv2.addWeighted(img_for_overlay, 0.6, heatmap_color, 0.4, 0)
 
-    # Encode overlay image to base64
-    _, buffer = cv2.imencode('.png', cv2.cvtColor(superimposed_img, cv2.COLOR_RGB2BGR))
+    overlay = cv2.addWeighted(img_np, 0.6, heatmap_color, 0.4, 0)
+
+    _, buffer = cv2.imencode('.png', cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR))
     gradcam_base64 = base64.b64encode(buffer).decode('utf-8')
+
+    # lime_result = explain_image_with_lime(
+    #     model=model,
+    #     pil_image=image,
+    #     top_labels=1,
+    #     num_samples=500,
+    #     num_features=5,
+    #     positive_only=True
+    # )
+    # lime_base64 = lime_result["lime_overlay_base64"]
 
     return {
         "class_id": pred_class,
-        "class_name": label_map[pred_class],
+        "diagnosis": label_map[pred_class],
         "confidence": confidence,
-        "gradcam": gradcam_base64
+        "gradcam": gradcam_base64,
+        # "lime": lime_base64
     }
 
-prompt = PromptTemplate(
-    template='''
-    You are a helpful medical assistant. A user has uploaded an image of an eye and received a diagnosis.
-    The diagnosis is {diagnosis} with a confidence of {confidence:.2f}.
-    
-    You should provide the user with information about the diagnosis, possible next steps, and any relevant advice.
-    ''',
-    input_variables=["diagnosis", "confidence"]
-)
 
-load_dotenv()
-@app.post('/chat')
-async def chat(request: ChatRequest):
-    llm = ChatOpenAI(model_name="gpt-3.5-turbo", temperature=0.4)
-    template = prompt.invoke({"diagnosis": label_map[request.pred_class], "confidence": request.confidence})
-    response = llm.invoke(template)
-    return {"message": str(response.content)}
+
+@app.post("/chat")
+async def chat_endpoint(request: Request):
+    data = await request.json()
+    session_id = data.get("session_id")
+    user_question = data.get("question")
+
+    if not user_question:
+        return {"reply": "please provide a question"}
+
+    try:
+        bot_reply = chain_with_history.invoke(
+            {"question": user_question},
+            config={"configurable": {"session_id": session_id}}  
+        )
+        return {"reply": str(bot_reply)}
+    except Exception as e:
+        print("\n====== CHAT ERROR TRACEBACK ======\n")
+        traceback.print_exc()
+        print("\n=================================\n")
+        return {"reply": str(e)}
