@@ -4,8 +4,8 @@ import logging
 logging.getLogger("tensorflow").setLevel(logging.ERROR)
 
 from fastapi import FastAPI, File, UploadFile, HTTPException, Request
+from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
-# from lime_explainer import explain_image_with_lime
 from PIL import Image
 import numpy as np
 import io
@@ -17,13 +17,23 @@ from pydantic import BaseModel
 from dotenv import load_dotenv
 from pytorch_grad_cam.utils.image import show_cam_on_image
 from conversion import load_image_as_cv2_rgb
-from chat import chain_with_history
+from langchain_core.messages import HumanMessage
+from rag import app as rag_app, llm_tool
 import torch
 from torchvision import transforms
 from model import load_retinopathy_model
 from pytorch_grad_cam import GradCAM
 from pytorch_grad_cam.utils.image import show_cam_on_image
 import traceback
+from fastapi import Depends
+from sqlalchemy.orm import Session
+from auth import (
+    SignupRequest, LoginRequest, TokenResponse,
+    hash_password, verify_password, create_access_token,
+    get_db, get_current_user, UserDB, oauth2_scheme,
+)
+from jose import JWTError, jwt
+from auth import SECRET_KEY, ALGORITHM
 
 load_dotenv()
 
@@ -44,6 +54,46 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
+# ===================== AUTH ENDPOINTS =====================
+
+@app.post("/auth/signup", response_model=TokenResponse)
+def signup(body: SignupRequest, db: Session = Depends(get_db)):
+    if db.query(UserDB).filter(UserDB.username == body.username).first():
+        raise HTTPException(status_code=400, detail="Username already taken")
+    if db.query(UserDB).filter(UserDB.email == body.email).first():
+        raise HTTPException(status_code=400, detail="Email already registered")
+
+    user = UserDB(
+        username=body.username,
+        email=body.email,
+        hashed_password=hash_password(body.password),
+    )
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+
+    token = create_access_token({"sub": user.username})
+    return TokenResponse(access_token=token, username=user.username)
+
+
+@app.post("/auth/login", response_model=TokenResponse)
+def login(body: LoginRequest, db: Session = Depends(get_db)):
+    user = db.query(UserDB).filter(UserDB.username == body.username).first()
+    if not user or not verify_password(body.password, user.hashed_password):
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+
+    token = create_access_token({"sub": user.username})
+    return TokenResponse(access_token=token, username=user.username)
+
+
+@app.get("/auth/me")
+def get_me(current_user: UserDB = Depends(get_current_user)):
+    return {"username": current_user.username, "email": current_user.email}
+
+# ===================== MODEL SETUP =====================
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 MODEL_PATH = "models/best_efficientnet.pth"
@@ -104,43 +154,76 @@ async def predict(file: UploadFile = File(...)):
     _, buffer = cv2.imencode('.png', cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR))
     gradcam_base64 = base64.b64encode(buffer).decode('utf-8')
 
-    # lime_result = explain_image_with_lime(
-    #     model=model,
-    #     pil_image=image,
-    #     top_labels=1,
-    #     num_samples=500,
-    #     num_features=5,
-    #     positive_only=True
-    # )
-    # lime_base64 = lime_result["lime_overlay_base64"]
-
     return {
         "class_id": pred_class,
         "diagnosis": label_map[pred_class],
         "confidence": confidence,
         "gradcam": gradcam_base64,
-        # "lime": lime_base64
     }
 
 
-
+#Not using this endpoint for now, but keeping it here for future use if needed
 @app.post("/chat")
 async def chat_endpoint(request: Request):
     data = await request.json()
-    session_id = data.get("session_id")
     user_question = data.get("question")
 
     if not user_question:
         return {"reply": "please provide a question"}
+    
+    # Get username from token for thread_id
+    thread_id = "default"
+    auth_header = request.headers.get("authorization", "")
+    if auth_header.startswith("Bearer "):
+        try:
+            payload = jwt.decode(auth_header[7:], SECRET_KEY, algorithms=[ALGORITHM])
+            thread_id = payload.get("sub", "default")
+        except JWTError:
+            pass
 
-    try:
-        bot_reply = chain_with_history.invoke(
-            {"question": user_question},
-            config={"configurable": {"session_id": session_id}}  
-        )
-        return {"reply": str(bot_reply)}
-    except Exception as e:
-        print("\n====== CHAT ERROR TRACEBACK ======\n")
-        traceback.print_exc()
-        print("\n=================================\n")
-        return {"reply": str(e)}
+    messages = [HumanMessage(content=user_question)]
+    config = {"configurable": {"thread_id": thread_id}}
+    result_state = rag_app.invoke({"messages": messages}, config=config)
+
+    msgs = result_state.get("messages")
+
+    if isinstance(msgs, list) and len(msgs) > 0:
+        last = msgs[-1]
+        reply_text = getattr(last, "content", str(last))
+    else:
+        reply_text = str(result_state)
+        
+    return {"reply": str(reply_text)}
+
+
+@app.post("/chat/stream")
+async def chat_stream_endpoint(request: Request):
+    data = await request.json()
+    user_question = data.get("question")
+
+    # Get username from token for thread_id
+    thread_id = "default"
+    auth_header = request.headers.get("authorization", "")
+    if auth_header.startswith("Bearer "):
+        try:
+            payload = jwt.decode(auth_header[7:], SECRET_KEY, algorithms=[ALGORITHM])
+            thread_id = payload.get("sub", "default")
+        except JWTError:
+            pass
+
+    messages = [HumanMessage(content=user_question)]
+    config = {"configurable": {"thread_id": thread_id}}
+
+    def event_generator():
+        for message_chunk, metadata in rag_app.stream(
+            {"messages": messages},
+            config=config,
+            stream_mode="messages",
+        ):
+            if message_chunk.content and metadata.get("langgraph_node") == "chat node":
+                yield f"data: {message_chunk.content}\n\n"
+        yield "data: [DONE]\n\n"
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+
