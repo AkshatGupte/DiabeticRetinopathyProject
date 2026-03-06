@@ -20,7 +20,11 @@ build/
 dist/
 npm-debug.log
 yarn-error.log
-backend/models
+
+# Model weights (too large for git — download separately)
+*.pth
+*.pt
+*.onnx
 
 # VS Code
 .vscode/

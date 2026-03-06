@@ -14,6 +14,7 @@ warnings.filterwarnings("ignore", category=UserWarning)
 
 # default image size used by your model
 IMG_SIZE = (224, 224)
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 def _prepare_for_model(img_uint8):
     """
@@ -31,7 +32,7 @@ def predict_fn_for_lime(images, model):
     DOES NOT require model passed from main.py
     Uses lime_model loaded above.
     """
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
     preprocess = transforms.Compose([
         transforms.ToPILImage(),
         transforms.Resize((224, 224)),

@@ -1,7 +1,7 @@
 import React, { useState } from "react";
 import { useNavigate, Link } from "react-router-dom";
 
-const BACKEND_BASE = "http://127.0.0.1:8000";
+const BACKEND_BASE = process.env.REACT_APP_BACKEND_URL || "http://127.0.0.1:8000";
 
 export default function Login({ onLogin }) {
   const [username, setUsername] = useState("");

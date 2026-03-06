@@ -10,17 +10,22 @@ from langgraph.graph import START, StateGraph
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode, tools_condition
 from langgraph.checkpoint.memory import MemorySaver
+import os
 
 load_dotenv()
 
 llm_endpoint = HuggingFaceEndpoint(
     repo_id='openai/gpt-oss-120b',
-    task='text-generation'
+    task='text-generation',
+    max_new_tokens=2048,
 )
 
 llm = ChatHuggingFace(llm=llm_endpoint)
 
-loader = PyPDFLoader("../rag/fact_sheet_22_diabetic_retinopathy_new.pdf")
+## Changing to safer version 
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+_PDF_PATH = os.path.join(_BASE_DIR, "..", "rag", "fact_sheet_22_diabetic_retinopathy_new.pdf")
+loader = PyPDFLoader(_PDF_PATH)
 docs = loader.load()
 
 splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=100)

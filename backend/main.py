@@ -1,59 +1,52 @@
 import os
-os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 import logging
-logging.getLogger("tensorflow").setLevel(logging.ERROR)
+import json
+import base64
 
-from fastapi import FastAPI, File, UploadFile, HTTPException, Request
+import numpy as np
+import cv2
+import torch
+from torchvision import transforms
+from PIL import Image
+from fastapi import FastAPI, File, UploadFile, HTTPException, Request, Depends
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
-from PIL import Image
-import numpy as np
-import io
-import base64
-import matplotlib.pyplot as plt
-import cv2
-from typing import List, Dict
 from pydantic import BaseModel
 from dotenv import load_dotenv
-from pytorch_grad_cam.utils.image import show_cam_on_image
+from sqlalchemy.orm import Session
+from jose import JWTError, jwt
+from pytorch_grad_cam import GradCAM
+
 from conversion import load_image_as_cv2_rgb
 from langchain_core.messages import HumanMessage
 from rag import app as rag_app, llm_tool
-import torch
-from torchvision import transforms
 from model import load_retinopathy_model
-from pytorch_grad_cam import GradCAM
-from pytorch_grad_cam.utils.image import show_cam_on_image
-import traceback
-from fastapi import Depends
-from sqlalchemy.orm import Session
 from auth import (
     SignupRequest, LoginRequest, TokenResponse,
     hash_password, verify_password, create_access_token,
     get_db, get_current_user, UserDB, oauth2_scheme,
+    SECRET_KEY, ALGORITHM,
 )
-from jose import JWTError, jwt
-from auth import SECRET_KEY, ALGORITHM
 
 load_dotenv()
-
-app = FastAPI()
-
-class ChatRequest(BaseModel):
-    session_id: str
-    messages: List[Dict[str, str]] 
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 
-# Allow CORS for all origins (for development)
+app = FastAPI(title="RetinaAI API")
+
+# CORS — use ALLOWED_ORIGINS env var in production (comma-separated)
+_allowed_origins = os.getenv("ALLOWED_ORIGINS", "*").split(",")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Max upload size (10 MB)
+MAX_FILE_SIZE = 10 * 1024 * 1024
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -95,14 +88,10 @@ def get_me(current_user: UserDB = Depends(get_current_user)):
 
 # ===================== MODEL SETUP =====================
 
-device = "cuda" if torch.cuda.is_available() else "cpu"
 MODEL_PATH = "models/best_efficientnet.pth"
 model = load_retinopathy_model(MODEL_PATH)
 model.to(device)
 model.eval()
-
-
-IMG_SIZE = (224, 224)
 
 
 label_map = {0: "No_DR", 1: "Mild", 2: "Moderate", 3: "Severe", 4: "Proliferate_DR"}
@@ -117,8 +106,13 @@ preprocess = transforms.Compose([
 ])
 
 @app.post("/predict/")
-async def predict(file: UploadFile = File(...)):
+async def predict(
+    file: UploadFile = File(...),
+    current_user: UserDB = Depends(get_current_user),
+):
     contents = await file.read()
+    if len(contents) > MAX_FILE_SIZE:
+        raise HTTPException(status_code=413, detail="File too large. Max 10 MB.")
     ext = file.filename.split(".")[-1].lower()
 
     img_cv = load_image_as_cv2_rgb(contents, ext)
@@ -163,37 +157,37 @@ async def predict(file: UploadFile = File(...)):
 
 
 #Not using this endpoint for now, but keeping it here for future use if needed
-@app.post("/chat")
-async def chat_endpoint(request: Request):
-    data = await request.json()
-    user_question = data.get("question")
+# @app.post("/chat")
+# async def chat_endpoint(request: Request):
+#     data = await request.json()
+#     user_question = data.get("question")
 
-    if not user_question:
-        return {"reply": "please provide a question"}
+#     if not user_question:
+#         return {"reply": "please provide a question"}
     
-    # Get username from token for thread_id
-    thread_id = "default"
-    auth_header = request.headers.get("authorization", "")
-    if auth_header.startswith("Bearer "):
-        try:
-            payload = jwt.decode(auth_header[7:], SECRET_KEY, algorithms=[ALGORITHM])
-            thread_id = payload.get("sub", "default")
-        except JWTError:
-            pass
+#     # Get username from token for thread_id
+#     thread_id = "default"
+#     auth_header = request.headers.get("authorization", "")
+#     if auth_header.startswith("Bearer "):
+#         try:
+#             payload = jwt.decode(auth_header[7:], SECRET_KEY, algorithms=[ALGORITHM])
+#             thread_id = payload.get("sub", "default")
+#         except JWTError:
+#             pass
 
-    messages = [HumanMessage(content=user_question)]
-    config = {"configurable": {"thread_id": thread_id}}
-    result_state = rag_app.invoke({"messages": messages}, config=config)
+#     messages = [HumanMessage(content=user_question)]
+#     config = {"configurable": {"thread_id": thread_id}}
+#     result_state = rag_app.invoke({"messages": messages}, config=config)
 
-    msgs = result_state.get("messages")
+#     msgs = result_state.get("messages")
 
-    if isinstance(msgs, list) and len(msgs) > 0:
-        last = msgs[-1]
-        reply_text = getattr(last, "content", str(last))
-    else:
-        reply_text = str(result_state)
+#     if isinstance(msgs, list) and len(msgs) > 0:
+#         last = msgs[-1]
+#         reply_text = getattr(last, "content", str(last))
+#     else:
+#         reply_text = str(result_state)
         
-    return {"reply": str(reply_text)}
+#     return {"reply": str(reply_text)}
 
 
 @app.post("/chat/stream")
@@ -201,8 +195,10 @@ async def chat_stream_endpoint(request: Request):
     data = await request.json()
     user_question = data.get("question")
 
-    # Get username from token for thread_id
+    # Default thread
     thread_id = "default"
+
+    # Extract user from JWT for memory thread
     auth_header = request.headers.get("authorization", "")
     if auth_header.startswith("Bearer "):
         try:
@@ -211,19 +207,25 @@ async def chat_stream_endpoint(request: Request):
         except JWTError:
             pass
 
-    messages = [HumanMessage(content=user_question)]
     config = {"configurable": {"thread_id": thread_id}}
+
+    # Only new user message — LangGraph will load past memory automatically
+    inputs = {
+        "messages": [HumanMessage(content=user_question)]
+    }
 
     def event_generator():
         for message_chunk, metadata in rag_app.stream(
-            {"messages": messages},
+            inputs,
             config=config,
             stream_mode="messages",
         ):
-            if message_chunk.content and metadata.get("langgraph_node") == "chat node":
-                yield f"data: {message_chunk.content}\n\n"
+            if (
+                message_chunk.content
+                and metadata.get("langgraph_node") == "chat node"
+            ):
+                yield f"data: {json.dumps(message_chunk.content)}\n\n"
+
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
-
-

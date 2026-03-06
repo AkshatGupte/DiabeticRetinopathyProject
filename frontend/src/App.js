@@ -3,7 +3,7 @@ import { Routes, Route, Navigate, useNavigate } from "react-router-dom";
 import Login from "./Login";
 import Signup from "./Signup";
 
-const BACKEND_BASE = "http://127.0.0.1:8000";
+const BACKEND_BASE = process.env.REACT_APP_BACKEND_URL || "http://127.0.0.1:8000";
 
 function Dashboard({ username, onLogout }) {
   const navigate = useNavigate();
@@ -45,7 +45,14 @@ function Dashboard({ username, onLogout }) {
     try {
       const fd = new FormData();
       fd.append("file", file, file.name);
-      const res = await fetch(`${BACKEND_BASE}/predict/`, { method: "POST", body: fd });
+      const token = localStorage.getItem("token");
+      const res = await fetch(`${BACKEND_BASE}/predict/`, {
+        method: "POST",
+        headers: {
+          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        },
+        body: fd,
+      });
       if (!res.ok) throw new Error(`Server returned ${res.status}`);
       const data = await res.json();
       setResult(data);
@@ -88,13 +95,15 @@ function Dashboard({ username, onLogout }) {
         const lines = text.split("\n");
         for (const line of lines) {
           if (line.startsWith("data: ")) {
-            const token = line.slice(6);
-            if (token === "[DONE]") break;
+            const raw = line.slice(6);
+            if (raw === "[DONE]") break;
+            let chunk;
+            try { chunk = JSON.parse(raw); } catch { chunk = raw; }
             // Append token to the last (assistant) message
             setMessages((prev) => {
               const updated = [...prev];
               const last = updated[updated.length - 1];
-              updated[updated.length - 1] = { ...last, content: last.content + token };
+              updated[updated.length - 1] = { ...last, content: last.content + chunk };
               return updated;
             });
           }
