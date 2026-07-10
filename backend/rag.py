@@ -9,8 +9,8 @@ from typing import Annotated, TypedDict
 from langgraph.graph import START, StateGraph
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode, tools_condition
-from langgraph.checkpoint.memory import MemorySaver
 import os
+import sqlite3
 
 load_dotenv()
 
@@ -22,17 +22,25 @@ llm_endpoint = HuggingFaceEndpoint(
 
 llm = ChatHuggingFace(llm=llm_endpoint)
 
-## Changing to safer version 
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 _PDF_PATH = os.path.join(_BASE_DIR, "..", "rag", "fact_sheet_22_diabetic_retinopathy_new.pdf")
-loader = PyPDFLoader(_PDF_PATH)
-docs = loader.load()
-
-splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=100)
-chunks = splitter.split_documents(docs)
+_INDEX_DIR = os.path.join(_BASE_DIR, "faiss_index")
 
 embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
-vector_store = FAISS.from_documents(chunks, embeddings)
+
+if os.path.isdir(_INDEX_DIR):
+    # Reuse the saved index — skips PDF parsing + embedding on every boot.
+    # Deserialization is safe here: the index is written by us, below.
+    vector_store = FAISS.load_local(
+        _INDEX_DIR, embeddings, allow_dangerous_deserialization=True
+    )
+else:
+    loader = PyPDFLoader(_PDF_PATH)
+    docs = loader.load()
+    splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=100)
+    chunks = splitter.split_documents(docs)
+    vector_store = FAISS.from_documents(chunks, embeddings)
+    vector_store.save_local(_INDEX_DIR)
 
 retriever = vector_store.as_retriever(search_type='similarity', search_kwargs={'k': 4})
 
@@ -41,7 +49,7 @@ retriever = vector_store.as_retriever(search_type='similarity', search_kwargs={'
 def rag_tool(query: str) -> str:
     """Retrieve relevant info from diabetic retinopathy PDF."""
 
-    docs = retriever.get_relevant_documents(query)
+    docs = retriever.invoke(query)
     context = "\n\n".join([doc.page_content for doc in docs])
 
     return f"""
@@ -94,8 +102,28 @@ graph.add_edge(START, 'chat node')
 graph.add_conditional_edges('chat node', tools_condition)
 graph.add_edge('tools', 'chat node')
 
-memory = MemorySaver()
+# ---- Persistent conversation memory ----
+# Postgres in production (same DATABASE_URL as auth), SQLite file locally.
+# Either way, chat history survives server restarts.
+DATABASE_URL = os.getenv("DATABASE_URL", "")
+
+if DATABASE_URL.startswith("postgres"):
+    from psycopg_pool import ConnectionPool
+    from langgraph.checkpoint.postgres import PostgresSaver
+
+    _pool = ConnectionPool(
+        DATABASE_URL,
+        max_size=5,
+        kwargs={"autocommit": True, "prepare_threshold": 0},
+    )
+    memory = PostgresSaver(_pool)
+    memory.setup()  # creates checkpoint tables if they don't exist
+else:
+    from langgraph.checkpoint.sqlite import SqliteSaver
+
+    _conn = sqlite3.connect(
+        os.path.join(_BASE_DIR, "chat_memory.db"), check_same_thread=False
+    )
+    memory = SqliteSaver(_conn)
+
 app = graph.compile(checkpointer=memory)
-
-
-

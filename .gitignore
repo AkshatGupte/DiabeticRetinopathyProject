@@ -26,5 +26,19 @@ yarn-error.log
 *.pt
 *.onnx
 
+# Training dataset (too large for git — download separately)
+colored_images/
+
+# Training data + experiment scripts (not used by the app)
+data/
+
+# Derived at runtime
+backend/faiss_index/
+*.log
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+coverage/
+
 # VS Code
 .vscode/

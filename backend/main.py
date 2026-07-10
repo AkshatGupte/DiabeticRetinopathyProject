@@ -1,42 +1,40 @@
 import os
-import logging
 import json
 import base64
+import threading
 
 import numpy as np
 import cv2
 import torch
 from torchvision import transforms
 from PIL import Image
-from fastapi import FastAPI, File, UploadFile, HTTPException, Request, Depends
+from fastapi import FastAPI, File, UploadFile, HTTPException, Depends
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
 from sqlalchemy.orm import Session
-from jose import JWTError, jwt
 from pytorch_grad_cam import GradCAM
 
 from conversion import load_image_as_cv2_rgb
 from langchain_core.messages import HumanMessage
-from rag import app as rag_app, llm_tool
+from rag import app as rag_app
 from model import load_retinopathy_model
 from auth import (
     SignupRequest, LoginRequest, TokenResponse,
     hash_password, verify_password, create_access_token,
-    get_db, get_current_user, UserDB, oauth2_scheme,
-    SECRET_KEY, ALGORITHM,
+    get_db, get_current_user, UserDB,
 )
 
 load_dotenv()
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-
 app = FastAPI(title="RetinaAI API")
 
-# CORS — use ALLOWED_ORIGINS env var in production (comma-separated)
-_allowed_origins = os.getenv("ALLOWED_ORIGINS", "*").split(",")
+# CORS — set ALLOWED_ORIGINS env var in production (comma-separated).
+# A wildcard is invalid when allow_credentials=True, so default to local dev origins.
+_allowed_origins = os.getenv(
+    "ALLOWED_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000"
+).split(",")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_allowed_origins,
@@ -49,6 +47,11 @@ app.add_middleware(
 MAX_FILE_SIZE = 10 * 1024 * 1024
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
 
 # ===================== AUTH ENDPOINTS =====================
 
@@ -88,7 +91,8 @@ def get_me(current_user: UserDB = Depends(get_current_user)):
 
 # ===================== MODEL SETUP =====================
 
-MODEL_PATH = "models/best_efficientnet.pth"
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+MODEL_PATH = os.path.join(_BASE_DIR, "models", "best_efficientnet.pth")
 model = load_retinopathy_model(MODEL_PATH)
 model.to(device)
 model.eval()
@@ -105,37 +109,48 @@ preprocess = transforms.Compose([
     ),
 ])
 
+# One GradCAM instance for the app's lifetime — creating one per request
+# re-registers hooks on the shared model and leaks them.
+_target_layer = model.blocks[-1][-1].conv_pw
+_cam = GradCAM(model=model, target_layers=[_target_layer])
+
+# The shared model isn't safe for concurrent Grad-CAM backward passes.
+_predict_lock = threading.Lock()
+
+
 @app.post("/predict/")
-async def predict(
+def predict(
     file: UploadFile = File(...),
     current_user: UserDB = Depends(get_current_user),
 ):
-    contents = await file.read()
+    contents = file.file.read()
     if len(contents) > MAX_FILE_SIZE:
         raise HTTPException(status_code=413, detail="File too large. Max 10 MB.")
-    ext = file.filename.split(".")[-1].lower()
 
-    img_cv = load_image_as_cv2_rgb(contents, ext)
+    filename = file.filename or ""
+    if "." not in filename:
+        raise HTTPException(status_code=400, detail="File must have a .jpg, .png or .dcm extension")
+    ext = filename.rsplit(".", 1)[-1].lower()
+
+    try:
+        img_cv = load_image_as_cv2_rgb(contents, ext)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
     image = Image.fromarray(img_cv)
     img_tensor = preprocess(image).unsqueeze(0).to(device)
 
-    
-    # Run model prediction
+    with _predict_lock:
+        # Run model prediction
+        with torch.no_grad():
+            logits = model(img_tensor)
+            probs = torch.softmax(logits, dim=1)
 
-    with torch.no_grad():
-        logits = model(img_tensor)
-        probs = torch.softmax(logits, dim=1)
+        pred_class = int(torch.argmax(probs))
+        confidence = float(torch.max(probs))
 
-    pred_class = int(torch.argmax(probs))
-    confidence = float(torch.max(probs))
-
-    # Generate Grad-CAM heatmap
-
-    target_layer = model.blocks[-1][-1].conv_pw
-    cam = GradCAM(model=model, target_layers=[target_layer])
-
-    grayscale_cam = cam(input_tensor=img_tensor)[0]
-    heatmap = grayscale_cam
+        # Generate Grad-CAM heatmap (needs gradients — runs outside no_grad)
+        heatmap = _cam(input_tensor=img_tensor)[0]
 
     # Convert heatmap to overlay
     img_np = np.array(image.resize((224, 224)))
@@ -152,67 +167,31 @@ async def predict(
         "class_id": pred_class,
         "diagnosis": label_map[pred_class],
         "confidence": confidence,
+        "probabilities": {
+            label_map[i]: round(float(p), 4) for i, p in enumerate(probs[0].tolist())
+        },
         "gradcam": gradcam_base64,
     }
 
 
-#Not using this endpoint for now, but keeping it here for future use if needed
-# @app.post("/chat")
-# async def chat_endpoint(request: Request):
-#     data = await request.json()
-#     user_question = data.get("question")
+# ===================== CHAT =====================
 
-#     if not user_question:
-#         return {"reply": "please provide a question"}
-    
-#     # Get username from token for thread_id
-#     thread_id = "default"
-#     auth_header = request.headers.get("authorization", "")
-#     if auth_header.startswith("Bearer "):
-#         try:
-#             payload = jwt.decode(auth_header[7:], SECRET_KEY, algorithms=[ALGORITHM])
-#             thread_id = payload.get("sub", "default")
-#         except JWTError:
-#             pass
-
-#     messages = [HumanMessage(content=user_question)]
-#     config = {"configurable": {"thread_id": thread_id}}
-#     result_state = rag_app.invoke({"messages": messages}, config=config)
-
-#     msgs = result_state.get("messages")
-
-#     if isinstance(msgs, list) and len(msgs) > 0:
-#         last = msgs[-1]
-#         reply_text = getattr(last, "content", str(last))
-#     else:
-#         reply_text = str(result_state)
-        
-#     return {"reply": str(reply_text)}
+class ChatRequest(BaseModel):
+    question: str
 
 
 @app.post("/chat/stream")
-async def chat_stream_endpoint(request: Request):
-    data = await request.json()
-    user_question = data.get("question")
+def chat_stream_endpoint(
+    body: ChatRequest,
+    current_user: UserDB = Depends(get_current_user),
+):
+    question = body.question.strip()
+    if not question:
+        raise HTTPException(status_code=400, detail="Please provide a question")
 
-    # Default thread
-    thread_id = "default"
-
-    # Extract user from JWT for memory thread
-    auth_header = request.headers.get("authorization", "")
-    if auth_header.startswith("Bearer "):
-        try:
-            payload = jwt.decode(auth_header[7:], SECRET_KEY, algorithms=[ALGORITHM])
-            thread_id = payload.get("sub", "default")
-        except JWTError:
-            pass
-
-    config = {"configurable": {"thread_id": thread_id}}
-
-    # Only new user message — LangGraph will load past memory automatically
-    inputs = {
-        "messages": [HumanMessage(content=user_question)]
-    }
+    # Per-user memory thread — LangGraph loads past messages automatically
+    config = {"configurable": {"thread_id": current_user.username}}
+    inputs = {"messages": [HumanMessage(content=question)]}
 
     def event_generator():
         for message_chunk, metadata in rag_app.stream(

@@ -53,6 +53,10 @@ function Dashboard({ username, onLogout }) {
         },
         body: fd,
       });
+      if (res.status === 401) {
+        handleLogout();
+        return;
+      }
       if (!res.ok) throw new Error(`Server returned ${res.status}`);
       const data = await res.json();
       setResult(data);
@@ -81,32 +85,43 @@ function Dashboard({ username, onLogout }) {
         body: JSON.stringify({ question }),
       });
 
+      if (res.status === 401) {
+        handleLogout();
+        return;
+      }
+      if (!res.ok) throw new Error(`Server returned ${res.status}`);
+
       // Add an empty assistant message that we'll fill incrementally
       setMessages((m) => [...m, { role: "assistant", content: "" }]);
 
       const reader = res.body.getReader();
       const decoder = new TextDecoder();
+      // Buffer across network chunks — an SSE "data: ..." line can arrive split
+      let buffer = "";
+      let streamDone = false;
 
-      while (true) {
+      while (!streamDone) {
         const { done, value } = await reader.read();
         if (done) break;
-        const text = decoder.decode(value, { stream: true });
-        // Parse SSE lines: each chunk is "data: ...\n\n"
-        const lines = text.split("\n");
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop(); // keep the (possibly incomplete) last line
         for (const line of lines) {
-          if (line.startsWith("data: ")) {
-            const raw = line.slice(6);
-            if (raw === "[DONE]") break;
-            let chunk;
-            try { chunk = JSON.parse(raw); } catch { chunk = raw; }
-            // Append token to the last (assistant) message
-            setMessages((prev) => {
-              const updated = [...prev];
-              const last = updated[updated.length - 1];
-              updated[updated.length - 1] = { ...last, content: last.content + chunk };
-              return updated;
-            });
+          if (!line.startsWith("data: ")) continue;
+          const raw = line.slice(6);
+          if (raw === "[DONE]") {
+            streamDone = true;
+            break;
           }
+          let chunk;
+          try { chunk = JSON.parse(raw); } catch { chunk = raw; }
+          // Append token to the last (assistant) message
+          setMessages((prev) => {
+            const updated = [...prev];
+            const last = updated[updated.length - 1];
+            updated[updated.length - 1] = { ...last, content: last.content + chunk };
+            return updated;
+          });
         }
       }
 
@@ -160,7 +175,7 @@ function Dashboard({ username, onLogout }) {
         <div style={{ background: "#fff", padding: 20, borderRadius: 12, boxShadow: "0 6px 20px rgba(16,24,40,0.04)" }}>
           <h2 style={{ margin: 0, marginBottom: 12 }}>Predict</h2>
           <form onSubmit={handleSubmit} style={{ display: "flex", gap: 12, alignItems: "center" }}>
-            <input type="file" accept="image/*" onChange={handleFileChange} />
+            <input type="file" accept="image/*,.dcm" onChange={handleFileChange} />
             <button type="submit" disabled={loading || !file} style={{ padding: "8px 12px", borderRadius: 8, background: "#0ea5e9", color: "#fff", border: "none" }}>{loading ? "Predicting..." : "Predict"}</button>
           </form>
 
@@ -172,8 +187,25 @@ function Dashboard({ username, onLogout }) {
                 <div style={{ color: "#ef4444" }}>{result.error}</div>
               ) : (
                 <div>
-                  <div style={{ fontWeight: 700 }}>{result.diagnosis}</div>
+                  <div style={{ fontWeight: 700 }}>{result.diagnosis.replace(/_/g, " ")}</div>
                   <div style={{ color: "#334155" }}>Confidence: {(result.confidence * 100).toFixed(2)}%</div>
+                  {result.probabilities && (
+                    <div style={{ marginTop: 10 }}>
+                      {Object.entries(result.probabilities)
+                        .sort((a, b) => b[1] - a[1])
+                        .map(([name, p]) => (
+                          <div key={name} style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4, fontSize: 12 }}>
+                            <span style={{ width: 100, color: "#475569", fontWeight: name === result.diagnosis ? 700 : 400 }}>
+                              {name.replace(/_/g, " ")}
+                            </span>
+                            <div style={{ flex: 1, background: "#e2e8f0", borderRadius: 4, height: 8 }}>
+                              <div style={{ width: `${Math.round(p * 100)}%`, background: "#0284c7", height: 8, borderRadius: 4 }} />
+                            </div>
+                            <span style={{ width: 44, textAlign: "right", color: "#334155" }}>{(p * 100).toFixed(1)}%</span>
+                          </div>
+                        ))}
+                    </div>
+                  )}
                   {result.gradcam && <img src={`data:image/png;base64,${result.gradcam}`} alt="gradcam" style={{ width: "100%", marginTop: 8, borderRadius: 6 }} />}
                 </div>
               )}

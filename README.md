@@ -9,11 +9,11 @@ A full-stack web application that uses deep learning to classify diabetic retino
 
 ## Features
 
-- **Image Classification** — Upload a retinal image (JPG/PNG/DICOM) and get one of 5 diagnoses: No DR, Mild, Moderate, Severe, or Proliferative DR
+- **Image Classification** — Upload a retinal image (JPG/PNG/DICOM) and get one of 5 diagnoses (No DR, Mild, Moderate, Severe, or Proliferative DR) with per-class probabilities
 - **Grad-CAM Heatmaps** — Visual overlay showing which regions of the image the model focused on
 - **AI Medical Assistant** — RAG-powered chatbot that answers questions about diabetic retinopathy using a medical PDF as context, with streaming responses
 - **User Authentication** — JWT-based signup/login with bcrypt password hashing
-- **Conversation Memory** — Per-user chat history maintained across messages
+- **Conversation Memory** — Per-user chat history persisted in the database (Postgres in production, SQLite locally), survives server restarts
 
 ## Tech Stack
 
@@ -40,8 +40,10 @@ A full-stack web application that uses deep learning to classify diabetic retino
 │   ├── lime_explainer.py    # LIME explainability (not yet wired to endpoint)
 │   ├── requirements.txt
 │   ├── Procfile             # For deployment (Render/Railway)
+│   ├── faiss_index/         # Persisted vector index (auto-created on first boot)
 │   └── models/
 │       └── best_efficientnet.pth  # Trained model weights
+├── data/                    # Training data + experiment scripts (not used by the app)
 ├── frontend/
 │   ├── src/
 │   │   ├── App.js           # Dashboard — predict + chat UI
@@ -61,7 +63,7 @@ A full-stack web application that uses deep learning to classify diabetic retino
 | `POST` | `/auth/login` | No | Login, returns JWT |
 | `GET` | `/auth/me` | Yes | Current user info |
 | `POST` | `/predict/` | Yes | Upload retina image → diagnosis + Grad-CAM |
-| `POST` | `/chat/stream` | Optional | Ask the AI assistant (SSE streaming) |
+| `POST` | `/chat/stream` | Yes | Ask the AI assistant (SSE streaming) |
 | `GET` | `/health` | No | Health check |
 
 ## Model Details
